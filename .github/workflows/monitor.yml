@@ -5,6 +5,11 @@ on:
     - cron: "*/5 * * * *"   # быстрая проверка: только самые свежие записи
     - cron: "12 3 * * *"    # раз в сутки: полный проход по API
   workflow_dispatch:
+    inputs:
+      test:
+        description: "прислать тестовую карточку последней новостройки"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -30,6 +35,10 @@ jobs:
             "12 3 * * *"|"") python3 monitor_perm.py ;;
             *)               python3 monitor_perm.py --quick ;;
           esac
+
+      - name: Тестовая карточка
+        if: ${{ inputs.test }}
+        run: python3 monitor_perm.py --test-send
 
       - name: Сохранить состояние
         run: |

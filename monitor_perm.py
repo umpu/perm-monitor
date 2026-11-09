@@ -26,7 +26,8 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 API_URL = "https://xn--80az8a.xn--d1aqf.xn--p1ai/%D1%81%D0%B5%D1%80%D0%B2%D0%B8%D1%81%D1%8B/api/kn/object"
 REGION_CODE = 59
-SEEN_FILE  = os.path.join(BASE_DIR, "seen_ids.json")
+SEEN_FILE   = os.path.join(BASE_DIR, "seen_ids.json")
+GROUPS_FILE = os.path.join(BASE_DIR, "seen_groups.json")   # известные новостройки (ключи групп)
 FOUND_FILE = os.path.join(BASE_DIR, "found_objects.txt")
 PAGE_SIZE = 50
 MAX_WORKERS = 10
@@ -111,8 +112,9 @@ def send_telegram(text):
                                        "disable_web_page_preview": "true"}).encode()
         req = urllib.request.Request(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data=body)
-        with urllib.request.urlopen(req, timeout=15):
-            pass
+        with urllib.request.urlopen(req, timeout=15) as r:
+            resp = json.loads(r.read())
+        print("Telegram: message_id", resp.get("result", {}).get("message_id"))
     except Exception as e:
         print("Telegram error:", e)
 
@@ -142,7 +144,9 @@ def send_telegram_photo(photo, caption):
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
         with urllib.request.urlopen(req, timeout=30) as r:
             resp = json.loads(r.read())
-        if not resp.get("ok"):
+        if resp.get("ok"):
+            print("Telegram: message_id", resp.get("result", {}).get("message_id"))
+        else:
             print("Telegram photo error:", resp)
     except Exception as e:
         print("Telegram photo error:", e)
@@ -170,7 +174,28 @@ def load_seen():
     except Exception:
         return set()
 
+def load_seen_groups():
+    """None — файла ещё нет (первый прогон): всё считается известным, ничего не шлём."""
+    if not os.path.exists(GROUPS_FILE):
+        return None
+    try:
+        return {tuple(k) for k in json.load(open(GROUPS_FILE, encoding="utf-8"))}
+    except Exception:
+        return None
+
+def save_seen_groups(keys):
+    with open(GROUPS_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(k for k in keys), f, ensure_ascii=False)
+
 def main():
+    if "--test-send" in sys.argv:
+        perm = [o for o in scan() if o.get("rpdRegionCd") == REGION_CODE]
+        o = max(perm, key=lambda x: x["objId"])
+        print(f"тест: последняя новостройка ID {o['objId']}: {o.get('objAddr')}")
+        send_telegram_photo(o.get("hobjRenderPhotoUrl"), card_text([o]))
+        print("тест отправлен")
+        return
+
     quick = "--quick" in sys.argv
     try:
         all_objects = scan(QUICK_PAGES if quick else None)
@@ -203,9 +228,16 @@ def main():
     for i in new_ids:
         o = by_id[i]
         groups.setdefault(group_key(o), []).append(o)
-    records = sorted(groups.values(),
+
+    # Новый корпус в уже известной новостройке — не новость: молча добавляем в seen.
+    known = load_seen_groups()
+    first_groups = known is None
+    if first_groups:
+        known = set()
+    records = sorted((g for k, g in groups.items() if k not in known),
                      key=lambda g: max((o.get("objPublDt") or "") for o in g),
                      reverse=True)
+    quiet = len(groups) - len(records)
 
     if baseline:
         with open(FOUND_FILE, "w", encoding="utf-8") as f:
@@ -227,10 +259,14 @@ def main():
         else:
             tail = "" if quick else f" Всего в Пермском крае: {len(perm)}"
             print(f"[{now}] Новых объектов нет.{tail}")
+        if quiet:
+            print(f"[{now}] Новых корпусов в известных новостройках: {quiet} — не показываю")
 
     seen |= current_ids
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(seen), f, ensure_ascii=False)
+    known |= {group_key(o) for o in perm}
+    save_seen_groups(known)
 
 if __name__ == "__main__":
     main()
