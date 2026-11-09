@@ -36,10 +36,16 @@ jobs:
 
       - name: Проверка
         run: |
-          case "${{ github.event.schedule }}" in
-            "12 3 * * *"|"") python3 monitor_perm.py ;;
-            *)               python3 monitor_perm.py --quick ;;
-          esac
+          # Ручной запуск (кнопка или страховка watch.sh) — быстрый проход;
+          # полный — только суточным расписанием.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python3 monitor_perm.py --quick
+          else
+            case "${{ github.event.schedule }}" in
+              "12 3 * * *") python3 monitor_perm.py ;;
+              *)            python3 monitor_perm.py --quick ;;
+            esac
+          fi
 
       - name: Тестовая карточка
         if: ${{ inputs.test }}
