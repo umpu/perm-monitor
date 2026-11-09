@@ -1,8 +1,9 @@
-name: Мониторинг новостроек Пермского края
+name: check
 
 on:
   schedule:
-    - cron: "7 * * * *"   # каждый час в :07 UTC — не в начале часа, где очередь GitHub
+    - cron: "*/5 * * * *"   # быстрая проверка: только самые свежие записи
+    - cron: "12 3 * * *"    # раз в сутки: полный проход по API
   workflow_dispatch:
 
 permissions:
@@ -17,14 +18,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      TZ: Asia/Yekaterinburg   # Пермь — UTC+5; журнал пишется в местном времени
+      TZ: Asia/Yekaterinburg
       TG_TOKEN: ${{ secrets.TG_TOKEN }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Проверка
-        run: python3 monitor_perm.py
+        run: |
+          case "${{ github.event.schedule }}" in
+            "12 3 * * *"|"") python3 monitor_perm.py ;;
+            *)               python3 monitor_perm.py --quick ;;
+          esac
 
       - name: Сохранить состояние
         run: |
@@ -35,7 +40,7 @@ jobs:
             echo "Изменений нет"
             exit 0
           fi
-          git commit -m "мониторинг: $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git commit -m "state: $(date -u '+%Y-%m-%d %H:%M UTC')"
           git push
 
       - name: Пульс (раз в сутки)

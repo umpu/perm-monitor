@@ -30,6 +30,7 @@ SEEN_FILE  = os.path.join(BASE_DIR, "seen_ids.json")
 FOUND_FILE = os.path.join(BASE_DIR, "found_objects.txt")
 PAGE_SIZE = 50
 MAX_WORKERS = 10
+QUICK_PAGES = 3   # быстрый режим: только первые 50–150 самых свежих записей
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -80,34 +81,53 @@ def send_telegram(text):
     except Exception as e:
         print("Telegram error:", e)
 
-def main():
-    try:
-        first, total = fetch_page(0)
-    except Exception as e:
-        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Ошибка API: {e}")
-        sys.exit(1)
+def scan(max_pages=None):
+    first, total = fetch_page(0)
     if not first:
-        print("API вернул пустой список.")
-        return
-
+        return []
+    pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+    if max_pages:
+        pages = min(pages, max_pages)
     all_objects = list(first)
-    offsets = list(range(PAGE_SIZE, total, PAGE_SIZE))
+    offsets = list(range(PAGE_SIZE, pages * PAGE_SIZE, PAGE_SIZE))
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         for page in ex.map(fetch_page, offsets):
             all_objects.extend(page[0])
+    return all_objects
 
+def load_seen():
+    if not os.path.exists(SEEN_FILE):
+        return set()
+    try:
+        return set(json.load(open(SEEN_FILE, encoding="utf-8")))
+    except Exception:
+        return set()
+
+def main():
+    quick = "--quick" in sys.argv
+    try:
+        all_objects = scan(QUICK_PAGES if quick else None)
+    except Exception as e:
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Ошибка API: {e}")
+        sys.exit(1)
+    if not all_objects:
+        print("API вернул пустой список.")
+        return
+
+    seen = load_seen()
     perm = [o for o in all_objects if o.get("rpdRegionCd") == REGION_CODE]
+    new_ids = {o["objId"] for o in perm} - seen
+
+    # Новое появилось в свежих записях — тогда берём полный список,
+    # чтобы занести в журнал всё и не потерять объект, вставший не по порядку дат.
+    if quick and new_ids:
+        print("Новое в свежих записях — полный проход по API")
+        all_objects = scan()
+        perm = [o for o in all_objects if o.get("rpdRegionCd") == REGION_CODE]
+        new_ids = {o["objId"] for o in perm} - seen
+
     by_id = {o["objId"]: o for o in perm}
     current_ids = set(by_id)
-
-    seen = set()
-    if os.path.exists(SEEN_FILE):
-        try:
-            seen = set(json.load(open(SEEN_FILE, encoding="utf-8")))
-        except Exception:
-            seen = set()
-
-    new_ids = current_ids - seen
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     baseline = (len(seen) == 0)
 
@@ -136,7 +156,8 @@ def main():
             send_telegram("Новые новостройки (Пермский край):\n\n"
                           + "\n\n".join(fmt_obj(o) for o in records[:20]))
         else:
-            print(f"[{now}] Новых объектов нет. Всего в Пермском крае: {len(perm)}")
+            tail = "" if quick else f" Всего в Пермском крае: {len(perm)}"
+            print(f"[{now}] Новых объектов нет.{tail}")
 
     seen |= current_ids
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
