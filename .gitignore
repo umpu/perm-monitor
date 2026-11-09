@@ -1,0 +1,4 @@
+__pycache__/
+*.bak
+monitor.log
+.DS_Store
