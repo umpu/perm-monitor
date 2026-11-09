@@ -9,7 +9,7 @@
 Уведомления в Telegram включаются переменными окружения TG_TOKEN и TG_CHAT_ID.
 Только стандартная библиотека — внешние пакеты не нужны.
 """
-import http.cookiejar, json, os, sys, time, uuid
+import http.cookiejar, json, os, re, sys, time, uuid
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -74,10 +74,20 @@ def quarter(d):
     except Exception:
         return d or "?"
 
+def norm_name(s):
+    """«Новый Парковый. Этап 2» и «… Этап 3» — один проект: срезаем номер этапа/очереди/корпуса."""
+    s = (s or "").strip().strip('"').lower()
+    s = re.sub(r"\s*[.,—-]?\s*(этап|очередь|корпус|литер|секция|дом)\s*№?\s*[0-9ivx]+.*$", "", s)
+    return s.strip(" .—-")
+
 def group_key(o):
-    """Корпуса одной новостройки: один застройщик, одно название, один адрес."""
+    """Новостройка = проект застройщика: название без номера этапа/корпуса,
+    иначе — адрес. Так новый этап уже известного проекта не считается новостью."""
     dev = (o.get("developer") or {}).get("devId")
-    return (dev, (o.get("objCommercNm") or "").strip(), o.get("objAddr") or "")
+    name = norm_name(o.get("objCommercNm"))
+    if name:
+        return ("n", dev, name)
+    return ("a", dev, o.get("objAddr") or "")
 
 def group_info(objs):
     o = objs[0]
@@ -94,15 +104,15 @@ def group_info(objs):
 def group_line(objs):
     name, addr, dev, when, ids, n, newest = group_info(objs)
     corpus = "корпус" if n == 1 else f"корпусов {n}"
-    return f"«{name}» | {addr} | {dev} | ввод {when} | {corpus} | ID {ids} | {object_url(newest)}"
+    return f"«{name}» | {addr} | {dev} | {corpus} | ID {ids} | {object_url(newest)}"
 
 def card_text(objs):
     name, addr, dev, when, ids, n, newest = group_info(objs)
-    corpus = "корпус" if n == 1 else f"корпусов {n}"
-    head = f"«{name}»\n" if name != "объект без названия" else ""
-    return (f"🏗 Новое в Пермском крае\n\n"
-            f"{head}{addr}\n{dev}\n\n"
-            f"Ввод: {when} ({corpus})\nID: {ids}\n\n{object_url(newest)}")
+    lines = [f"«{name}»" if name != "объект без названия" else "", addr, dev]
+    if n > 1:
+        lines += [f"корпусов {n}", f"ID: {ids}"]
+    lines += ["", object_url(newest)]
+    return "\n".join(x for x in lines if x is not None and (x != "" or True)).replace("\n\n\n", "\n\n")
 
 def send_telegram(text):
     if not TG_TOKEN or not TG_CHAT_ID:
