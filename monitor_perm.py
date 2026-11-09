@@ -61,6 +61,10 @@ def fetch_page(offset):
 
 SITE = "https://наш.дом.рф/новостройки/строящиеся/пермский-край/"
 
+def object_url(obj_id):
+    """Карточка объекта в каталоге (проверено в браузере 2026-11-10)."""
+    return f"https://наш.дом.рф/сервисы/каталог-новостроек/объект/{obj_id}"
+
 def quarter(d):
     """'2029-03-31' → 'I кв. 2029'."""
     try:
@@ -83,19 +87,21 @@ def group_info(objs):
     when = quarter(dates[0]) if len(dates) < 2 else f"{quarter(dates[0])} — {quarter(dates[-1])}"
     ids = ", ".join(str(x["objId"]) for x in sorted(objs, key=lambda x: x["objId"]))
     n = len(objs)
-    return name, addr, dev, when, ids, n
+    newest = max(x["objId"] for x in objs)
+    return name, addr, dev, when, ids, n, newest
 
 def group_line(objs):
-    name, addr, dev, when, ids, n = group_info(objs)
+    name, addr, dev, when, ids, n, newest = group_info(objs)
     corpus = "корпус" if n == 1 else f"корпусов {n}"
-    return f"«{name}» | {addr} | {dev} | ввод {when} | {corpus} | ID {ids}"
+    return f"«{name}» | {addr} | {dev} | ввод {when} | {corpus} | ID {ids} | {object_url(newest)}"
 
 def card_text(objs):
-    name, addr, dev, when, ids, n = group_info(objs)
+    name, addr, dev, when, ids, n, newest = group_info(objs)
     corpus = "корпус" if n == 1 else f"корпусов {n}"
+    head = f"«{name}»\n" if name != "объект без названия" else ""
     return (f"🏗 Новое в Пермском крае\n\n"
-            f"«{name}»\n{addr}\n{dev}\n\n"
-            f"Ввод: {when} ({corpus})\nID: {ids}\n\n{SITE}")
+            f"{head}{addr}\n{dev}\n\n"
+            f"Ввод: {when} ({corpus})\nID: {ids}\n\n{object_url(newest)}")
 
 def send_telegram(text):
     if not TG_TOKEN or not TG_CHAT_ID:
@@ -121,7 +127,7 @@ def send_telegram_photo(photo, caption):
     try:
         with OPENER.open(urllib.request.Request(photo, headers=HEADERS), timeout=25) as r:
             img = r.read()
-        if len(img) > 4_500_000:
+        if len(img) > 9_800_000:
             raise ValueError(f"фото {len(img)} байт — больше лимита sendPhoto")
         boundary = "----permmonitor" + uuid.uuid4().hex
         parts = []
