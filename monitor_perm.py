@@ -8,9 +8,10 @@
   found_objects.txt — человекочитаемый лог: дата обнаружения + метка + данные объекта
   tg_state.json     — позиция чтения обновлений Telegram (offset)
 
-Уведомления в Telegram включаются переменными окружения TG_TOKEN и TG_CHAT_ID.
-Бот приватный: карточки уходят только в TG_CHAT_ID, незнакомым — ответ «бот приватный».
-На /start владелец получает приветствие с примером карточки.
+Уведомления в Telegram включаются переменными окружения TG_TOKEN и TG_CHAT_ID;
+дополнительные разрешённые чаты — TG_CHAT_IDS через запятую.
+Бот приватный: карточки и приветствие уходят только в разрешённые чаты, остальным —
+«бот приватный», владельцу — одно уведомление о новом незнакомце.
 Только стандартная библиотека — внешние пакеты не нужны.
 """
 import html, http.cookiejar, json, os, re, sys, time
@@ -26,7 +27,10 @@ COOKIES = http.cookiejar.CookieJar()
 OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(COOKIES))
 
 TG_TOKEN   = os.environ.get("TG_TOKEN", "")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")   # владелец: отчёты и уведомления
+TG_CHAT_IDS = [x.strip() for x in os.environ.get("TG_CHAT_IDS", "").split(",") if x.strip()]
+# Кому можно слать карточки и приветствие: владелец + явно разрешённые чаты.
+RECIPIENTS = list(dict.fromkeys(([TG_CHAT_ID] if TG_CHAT_ID else []) + TG_CHAT_IDS))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 API_URL = "https://xn--80az8a.xn--d1aqf.xn--p1ai/%D1%81%D0%B5%D1%80%D0%B2%D0%B8%D1%81%D1%8B/api/kn/object"
@@ -159,8 +163,8 @@ def tg_api(method, params=None, timeout=15):
         return {"ok": False, "description": str(e)}
 
 def send_telegram(text, chat_id=None):
-    """Сообщение в Telegram. Фото больше не шлём: parse_mode=HTML, название ЖК жирным."""
-    chat_id = chat_id or TG_CHAT_ID
+    """Сообщение в Telegram. Фото не шлём: parse_mode=HTML, название ЖК жирным."""
+    chat_id = chat_id or (RECIPIENTS[0] if RECIPIENTS else "")
     if not TG_TOKEN or not chat_id:
         return  # уведомления не настроены — тихо пропускаем
     resp = tg_api("sendMessage", {"chat_id": chat_id, "text": text[:4000],
@@ -204,8 +208,16 @@ def greeting_text():
                  + card_text([o]))
     return text
 
+def who_msg(msg):
+    """«Имя Фамилия @username» автора сообщения (для уведомления владельцу)."""
+    who = msg.get("from") or {}
+    name = " ".join(x for x in (who.get("first_name"), who.get("last_name")) if x).strip()
+    uname = f" @{who['username']}" if who.get("username") else ""
+    return esc(name or "без имени") + esc(uname)
+
 def handle_updates():
-    """Приём обновлений: /start — приветствие владельцу, всем остальным — «бот приватный»."""
+    """Приём обновлений: /start — приветствие разрешённым чатам, всем остальным —
+    «бот приватный», а владельцу одно уведомление о новом незнакомце."""
     if not TG_TOKEN:
         return
     st = load_tg_state()
@@ -216,7 +228,8 @@ def handle_updates():
     if not resp.get("ok"):
         print("Telegram getUpdates:", resp.get("description"))
         return
-    told = set()
+    allowed = set(RECIPIENTS)
+    strangers = set(st.get("strangers") or [])
     for upd in resp.get("result", []):
         st["offset"] = max(st.get("offset", 0), upd["update_id"] + 1)
         msg = upd.get("message") or {}
@@ -224,14 +237,18 @@ def handle_updates():
         text = (msg.get("text") or "").strip()
         if not chat_id:
             continue
-        if TG_CHAT_ID and chat_id != TG_CHAT_ID:
-            if chat_id not in told:
-                told.add(chat_id)
-                send_telegram("Этот бот приватный.", chat_id=chat_id)
+        if chat_id not in allowed:
+            send_telegram("Этот бот приватный.", chat_id=chat_id)
+            if chat_id not in strangers:
+                strangers.add(chat_id)
+                send_telegram("Незнакомый чат написал боту: " + who_msg(msg) +
+                              f"\nid {chat_id}. Ответил «Этот бот приватный».\n"
+                              "Если это ваш человек — пришлите id, добавлю в TG_CHAT_IDS.")
             continue
         cmd = text.split()[0].split("@")[0] if text else ""
         if cmd == "/start":
             send_telegram(greeting_text(), chat_id=chat_id)
+    st["strangers"] = sorted(strangers)
     save_tg_state(st)
 
 def scan(max_pages=None):
@@ -344,7 +361,8 @@ def main():
             for g in records:
                 print(f"  {group_line(g)}")
             for g in records[:10]:
-                send_telegram(card_text(g))
+                for chat in RECIPIENTS:
+                    send_telegram(card_text(g), chat_id=chat)
         else:
             tail = "" if quick else f" Всего в Пермском крае: {len(perm)}"
             print(f"[{now}] Новых объектов нет.{tail}")

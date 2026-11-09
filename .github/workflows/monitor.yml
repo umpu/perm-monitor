@@ -30,6 +30,7 @@ jobs:
       TZ: Asia/Yekaterinburg
       TG_TOKEN: ${{ secrets.TG_TOKEN }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
     steps:
       - uses: actions/checkout@v4
 
