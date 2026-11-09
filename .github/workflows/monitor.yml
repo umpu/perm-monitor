@@ -10,6 +10,10 @@ on:
         description: "прислать тестовую карточку последней новостройки"
         type: boolean
         default: false
+      greeting:
+        description: "прислать приветствие, как на /start"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -40,11 +44,16 @@ jobs:
         if: ${{ inputs.test }}
         run: python3 monitor_perm.py --test-send
 
+      - name: Приветствие
+        if: ${{ inputs.greeting }}
+        run: python3 monitor_perm.py --test-greeting
+
       - name: Сохранить состояние
+        if: always()
         run: |
           git config user.name "perm-monitor"
           git config user.email "perm-monitor@users.noreply.github.com"
-          git add seen_ids.json found_objects.txt
+          git add seen_ids.json seen_groups.json found_objects.txt tg_state.json
           if git diff --cached --quiet; then
             echo "Изменений нет"
             exit 0

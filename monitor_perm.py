@@ -4,12 +4,17 @@
 
 Файлы (рядом со скриптом):
   seen_ids.json     — технический список уже увиденных objId (для сравнения)
+  seen_groups.json  — известные новостройки (ключи групп: застройщик + название + адрес)
   found_objects.txt — человекочитаемый лог: дата обнаружения + метка + данные объекта
+  tg_state.json     — позиция чтения обновлений Telegram (offset)
 
 Уведомления в Telegram включаются переменными окружения TG_TOKEN и TG_CHAT_ID.
+Бот приватный: карточки уходят только в TG_CHAT_ID, незнакомым — ответ «бот приватный».
+На /start владелец получает приветствие с примером карточки.
 Только стандартная библиотека — внешние пакеты не нужны.
 """
-import http.cookiejar, json, os, re, sys, time, uuid
+import html, http.cookiejar, json, os, re, sys, time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +34,7 @@ REGION_CODE = 59
 SEEN_FILE   = os.path.join(BASE_DIR, "seen_ids.json")
 GROUPS_FILE = os.path.join(BASE_DIR, "seen_groups.json")   # известные новостройки (ключи групп)
 FOUND_FILE = os.path.join(BASE_DIR, "found_objects.txt")
+TG_STATE_FILE = os.path.join(BASE_DIR, "tg_state.json")   # offset чтения обновлений Telegram
 PAGE_SIZE = 50
 MAX_WORKERS = 10
 QUICK_PAGES = 3   # быстрый режим: только первые 50–150 самых свежих записей
@@ -60,8 +66,6 @@ def fetch_page(offset):
                 raise
             time.sleep(2 * (attempt + 1))
 
-SITE = "https://наш.дом.рф/новостройки/строящиеся/пермский-край/"
-
 def object_url(obj_id):
     """Карточка объекта в каталоге (проверено в браузере 2026-11-10)."""
     return f"https://наш.дом.рф/сервисы/каталог-новостроек/объект/{obj_id}"
@@ -80,6 +84,25 @@ def norm_name(s):
     s = re.sub(r"\s*[.,—-]?\s*(этап|очередь|корпус|литер|секция|дом)\s*№?\s*[0-9ivx]+.*$", "", s)
     return s.strip(" .—-")
 
+def clean_name(raw):
+    """Название без внешних кавычек; парные ASCII-кавычки внутри — «…», одиночная убирается."""
+    name = (raw or "").strip()
+    while len(name) >= 2 and name[0] in "\"'«»„“" and name[-1] in "\"'«»„“":
+        name = name[1:-1].strip()
+    out, opened = [], False
+    for ch in name:
+        if ch == '"':
+            out.append("»" if opened else "«")
+            opened = not opened
+        else:
+            out.append(ch)
+    if opened:  # непарная кавычка в данных — не оставляем висящую
+        for i in range(len(out) - 1, -1, -1):
+            if out[i] == "«":
+                del out[i]
+                break
+    return "".join(out).strip()
+
 def group_key(o):
     """Новостройка = проект застройщика: название без номера этапа/корпуса,
     иначе — адрес. Так новый этап уже известного проекта не считается новостью."""
@@ -92,7 +115,7 @@ def group_key(o):
 def group_info(objs):
     o = objs[0]
     dev = (o.get("developer") or {}).get("shortName") or "?"
-    name = (o.get("objCommercNm") or "").strip().strip('"') or "объект без названия"
+    name = clean_name(o.get("objCommercNm")) or "объект без названия"
     addr = o.get("objAddr") or "?"
     dates = sorted(d for d in {x.get("objReady100PercDt") or "" for x in objs} if d)
     when = quarter(dates[0]) if len(dates) < 2 else f"{quarter(dates[0])} — {quarter(dates[-1])}"
@@ -106,61 +129,110 @@ def group_line(objs):
     corpus = "корпус" if n == 1 else f"корпусов {n}"
     return f"«{name}» | {addr} | {dev} | {corpus} | ID {ids} | {object_url(newest)}"
 
+def esc(s):
+    return html.escape(str(s), quote=False)
+
 def card_text(objs):
+    """Карточка для Telegram (parse_mode=HTML): название ЖК жирным, текст экранирован."""
     name, addr, dev, when, ids, n, newest = group_info(objs)
-    lines = [f"«{name}»" if name != "объект без названия" else "", addr, dev]
+    lines = [f"<b>{esc(name)}</b>", esc(addr), esc(dev)]
     if n > 1:
         lines += [f"корпусов {n}", f"ID: {ids}"]
-    lines += ["", object_url(newest)]
-    return "\n".join(x for x in lines if x is not None and (x != "" or True)).replace("\n\n\n", "\n\n")
+    lines += ["", esc(object_url(newest))]
+    return "\n".join(lines)
 
-def send_telegram(text):
-    if not TG_TOKEN or not TG_CHAT_ID:
+def tg_api(method, params=None, timeout=15):
+    """Вызов Telegram Bot API; None — если токен не задан."""
+    if not TG_TOKEN:
+        return None
+    data = urllib.parse.urlencode(params or {}).encode()
+    req = urllib.request.Request(f"https://api.telegram.org/bot{TG_TOKEN}/{method}", data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read())
+        except Exception:
+            return {"ok": False, "description": str(e)}
+    except Exception as e:
+        return {"ok": False, "description": str(e)}
+
+def send_telegram(text, chat_id=None):
+    """Сообщение в Telegram. Фото больше не шлём: parse_mode=HTML, название ЖК жирным."""
+    chat_id = chat_id or TG_CHAT_ID
+    if not TG_TOKEN or not chat_id:
         return  # уведомления не настроены — тихо пропускаем
-    try:
-        body = urllib.parse.urlencode({"chat_id": TG_CHAT_ID, "text": text[:4000],
-                                       "disable_web_page_preview": "true"}).encode()
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data=body)
-        with urllib.request.urlopen(req, timeout=15) as r:
-            resp = json.loads(r.read())
+    resp = tg_api("sendMessage", {"chat_id": chat_id, "text": text[:4000],
+                                  "parse_mode": "HTML",
+                                  "disable_web_page_preview": "true"})
+    if resp and resp.get("ok"):
         print("Telegram: message_id", resp.get("result", {}).get("message_id"))
-    except Exception as e:
-        print("Telegram error:", e)
+    else:
+        print("Telegram error:", (resp or {}).get("description"))
 
-def send_telegram_photo(photo, caption):
-    """Карточка с фото здания. Ссылку на файл Telegram не принимает (сервер отдаёт
-    картинку с чужим content-type), поэтому скачиваем сами и грузим multipart."""
-    if not TG_TOKEN or not TG_CHAT_ID:
-        return
-    if not photo:
-        send_telegram(caption)
-        return
+def load_tg_state():
     try:
-        with OPENER.open(urllib.request.Request(photo, headers=HEADERS), timeout=25) as r:
-            img = r.read()
-        if len(img) > 9_800_000:
-            raise ValueError(f"фото {len(img)} байт — больше лимита sendPhoto")
-        boundary = "----permmonitor" + uuid.uuid4().hex
-        parts = []
-        for name, value in (("chat_id", TG_CHAT_ID), ("caption", caption[:1000])):
-            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode())
-        parts.append((f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; "
-                      f"filename=\"photo.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n").encode()
-                     + img + b"\r\n")
-        parts.append(f"--{boundary}--\r\n".encode())
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto", data=b"".join(parts),
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            resp = json.loads(r.read())
-        if resp.get("ok"):
-            print("Telegram: message_id", resp.get("result", {}).get("message_id"))
-        else:
-            print("Telegram photo error:", resp)
+        with open(TG_STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_tg_state(st):
+    try:
+        with open(TG_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(st, f)
     except Exception as e:
-        print("Telegram photo error:", e)
-        send_telegram(caption)
+        print("tg_state не сохранён:", e)
+
+def latest_object():
+    """Последняя новостройка в списке: максимальный objId среди свежих записей."""
+    try:
+        first, _ = fetch_page(0)
+        perm = [o for o in first if o.get("rpdRegionCd") == REGION_CODE]
+        return max(perm, key=lambda x: x["objId"]) if perm else None
+    except Exception as e:
+        print("Пример для приветствия недоступен:", e)
+        return None
+
+def greeting_text():
+    text = ("Привет! Это приватный бот мониторинга новостроек Пермского края.\n"
+            "Когда на наш.дом.рф появляется новая новостройка, я присылаю карточку.")
+    o = latest_object()
+    if o:
+        text += ("\n\nНиже — пример карточки. Сейчас это последняя новостройка в списке:\n\n"
+                 + card_text([o]))
+    return text
+
+def handle_updates():
+    """Приём обновлений: /start — приветствие владельцу, всем остальным — «бот приватный»."""
+    if not TG_TOKEN:
+        return
+    st = load_tg_state()
+    resp = tg_api("getUpdates", {"offset": st.get("offset", 0), "timeout": 0,
+                                 "allowed_updates": '["message"]'})
+    if not resp:
+        return
+    if not resp.get("ok"):
+        print("Telegram getUpdates:", resp.get("description"))
+        return
+    told = set()
+    for upd in resp.get("result", []):
+        st["offset"] = max(st.get("offset", 0), upd["update_id"] + 1)
+        msg = upd.get("message") or {}
+        chat_id = str((msg.get("chat") or {}).get("id") or "")
+        text = (msg.get("text") or "").strip()
+        if not chat_id:
+            continue
+        if TG_CHAT_ID and chat_id != TG_CHAT_ID:
+            if chat_id not in told:
+                told.add(chat_id)
+                send_telegram("Этот бот приватный.", chat_id=chat_id)
+            continue
+        cmd = text.split()[0].split("@")[0] if text else ""
+        if cmd == "/start":
+            send_telegram(greeting_text(), chat_id=chat_id)
+    save_tg_state(st)
 
 def scan(max_pages=None):
     first, total = fetch_page(0)
@@ -202,9 +274,16 @@ def main():
         perm = [o for o in scan() if o.get("rpdRegionCd") == REGION_CODE]
         o = max(perm, key=lambda x: x["objId"])
         print(f"тест: последняя новостройка ID {o['objId']}: {o.get('objAddr')}")
-        send_telegram_photo(o.get("hobjRenderPhotoUrl"), card_text([o]))
+        send_telegram("Тест из CI — так будет выглядеть карточка:\n\n" + card_text([o]))
         print("тест отправлен")
         return
+
+    if "--test-greeting" in sys.argv:
+        send_telegram(greeting_text())
+        print("приветствие отправлено")
+        return
+
+    handle_updates()
 
     quick = "--quick" in sys.argv
     try:
@@ -265,7 +344,7 @@ def main():
             for g in records:
                 print(f"  {group_line(g)}")
             for g in records[:10]:
-                send_telegram_photo(g[0].get("hobjRenderPhotoUrl"), card_text(g))
+                send_telegram(card_text(g))
         else:
             tail = "" if quick else f" Всего в Пермском крае: {len(perm)}"
             print(f"[{now}] Новых объектов нет.{tail}")
