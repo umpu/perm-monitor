@@ -9,7 +9,7 @@
 Уведомления в Telegram включаются переменными окружения TG_TOKEN и TG_CHAT_ID.
 Только стандартная библиотека — внешние пакеты не нужны.
 """
-import http.cookiejar, json, os, sys, time
+import http.cookiejar, json, os, sys, time, uuid
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -59,14 +59,43 @@ def fetch_page(offset):
                 raise
             time.sleep(2 * (attempt + 1))
 
-def fmt_obj(o):
-    dev  = (o.get("developer") or {}).get("shortName") or "?"
-    name = o.get("commerNm") or ""
+SITE = "https://наш.дом.рф/новостройки/строящиеся/пермский-край/"
+
+def quarter(d):
+    """'2029-03-31' → 'I кв. 2029'."""
+    try:
+        y, m = d.split("-")[0], int(d.split("-")[1])
+        return f"{('I', 'II', 'III', 'IV')[(m - 1) // 3]} кв. {y}"
+    except Exception:
+        return d or "?"
+
+def group_key(o):
+    """Корпуса одной новостройки: один застройщик, одно название, один адрес."""
+    dev = (o.get("developer") or {}).get("devId")
+    return (dev, (o.get("objCommercNm") or "").strip(), o.get("objAddr") or "")
+
+def group_info(objs):
+    o = objs[0]
+    dev = (o.get("developer") or {}).get("shortName") or "?"
+    name = (o.get("objCommercNm") or "").strip().strip('"') or "объект без названия"
     addr = o.get("objAddr") or "?"
-    if name:
-        addr = f"{name}, {addr}"
-    return (f"ID {o['objId']} | опубликован {o.get('objPublDt','?')} | "
-            f"ввод {o.get('objReady100PercDt','?')} | {dev} | {addr}")
+    dates = sorted(d for d in {x.get("objReady100PercDt") or "" for x in objs} if d)
+    when = quarter(dates[0]) if len(dates) < 2 else f"{quarter(dates[0])} — {quarter(dates[-1])}"
+    ids = ", ".join(str(x["objId"]) for x in sorted(objs, key=lambda x: x["objId"]))
+    n = len(objs)
+    return name, addr, dev, when, ids, n
+
+def group_line(objs):
+    name, addr, dev, when, ids, n = group_info(objs)
+    corpus = "корпус" if n == 1 else f"корпусов {n}"
+    return f"«{name}» | {addr} | {dev} | ввод {when} | {corpus} | ID {ids}"
+
+def card_text(objs):
+    name, addr, dev, when, ids, n = group_info(objs)
+    corpus = "корпус" if n == 1 else f"корпусов {n}"
+    return (f"🏗 Новое в Пермском крае\n\n"
+            f"«{name}»\n{addr}\n{dev}\n\n"
+            f"Ввод: {when} ({corpus})\nID: {ids}\n\n{SITE}")
 
 def send_telegram(text):
     if not TG_TOKEN or not TG_CHAT_ID:
@@ -80,6 +109,38 @@ def send_telegram(text):
             pass
     except Exception as e:
         print("Telegram error:", e)
+
+def send_telegram_photo(photo, caption):
+    """Карточка с фото здания. Ссылку на файл Telegram не принимает (сервер отдаёт
+    картинку с чужим content-type), поэтому скачиваем сами и грузим multipart."""
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
+    if not photo:
+        send_telegram(caption)
+        return
+    try:
+        with OPENER.open(urllib.request.Request(photo, headers=HEADERS), timeout=25) as r:
+            img = r.read()
+        if len(img) > 4_500_000:
+            raise ValueError(f"фото {len(img)} байт — больше лимита sendPhoto")
+        boundary = "----permmonitor" + uuid.uuid4().hex
+        parts = []
+        for name, value in (("chat_id", TG_CHAT_ID), ("caption", caption[:1000])):
+            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode())
+        parts.append((f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; "
+                      f"filename=\"photo.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n").encode()
+                     + img + b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode())
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto", data=b"".join(parts),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read())
+        if not resp.get("ok"):
+            print("Telegram photo error:", resp)
+    except Exception as e:
+        print("Telegram photo error:", e)
+        send_telegram(caption)
 
 def scan(max_pages=None):
     first, total = fetch_page(0)
@@ -131,30 +192,32 @@ def main():
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     baseline = (len(seen) == 0)
 
-    records = sorted(
-        (by_id[i] for i in new_ids),
-        key=lambda o: (o.get("objPublDt") or "", o["objId"]),
-        reverse=True,
-    )
+    # Корпуса одной новостройки — одна запись: группируем по застройщику, названию и адресу.
+    groups = {}
+    for i in new_ids:
+        o = by_id[i]
+        groups.setdefault(group_key(o), []).append(o)
+    records = sorted(groups.values(),
+                     key=lambda g: max((o.get("objPublDt") or "") for o in g),
+                     reverse=True)
 
     if baseline:
         with open(FOUND_FILE, "w", encoding="utf-8") as f:
-            f.write(f"# Найдено объектов в Пермском крае — базовая линия от {now}\n")
-            f.write(f"# Всего: {len(records)}\n")
-            f.write("# Формат: дата обнаружения | метка | объект\n")
-            for o in records:
-                f.write(f"{now} | базовая линия | {fmt_obj(o)}\n")
-        print(f"Базовая линия записана: {len(records)} объектов → {FOUND_FILE}")
+            f.write(f"# Базовая линия от {now}: объектов {len(current_ids)}, новостроек {len(records)}\n")
+            f.write("# Формат: дата обнаружения | метка | новостройка | адрес | застройщик | ввод | корпусов | ID\n")
+            for g in records:
+                f.write(f"{now} | базовая линия | {group_line(g)}\n")
+        print(f"Базовая линия записана: {len(records)} новостроек ({len(current_ids)} объектов) → {FOUND_FILE}")
     else:
         if records:
             with open(FOUND_FILE, "a", encoding="utf-8") as f:
-                for o in records:
-                    f.write(f"{now} | НОВЫЙ | {fmt_obj(o)}\n")
-            print(f"[{now}] Найдено новых объектов: {len(records)}")
-            for o in records:
-                print(f"  {fmt_obj(o)}")
-            send_telegram("Новые новостройки (Пермский край):\n\n"
-                          + "\n\n".join(fmt_obj(o) for o in records[:20]))
+                for g in records:
+                    f.write(f"{now} | НОВЫЙ | {group_line(g)}\n")
+            print(f"[{now}] Новых новостроек: {len(records)} (объектов {len(new_ids)})")
+            for g in records:
+                print(f"  {group_line(g)}")
+            for g in records[:10]:
+                send_telegram_photo(g[0].get("hobjRenderPhotoUrl"), card_text(g))
         else:
             tail = "" if quick else f" Всего в Пермском крае: {len(perm)}"
             print(f"[{now}] Новых объектов нет.{tail}")
